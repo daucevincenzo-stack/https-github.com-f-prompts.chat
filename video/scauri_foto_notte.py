@@ -4,7 +4,7 @@ Dalla foto scattata all'ora blu (scauri_foto.jpg) ricava una scena notturna:
 orizzonte raddrizzato, cielo notturno con stelle e luna, riflesso lunare sulle onde,
 luci del lungomare e della torre, mare che si muove (effetto cinemagraph), zoom lento e titolo.
 
-Uso:  python3 scauri_foto_notte.py [--seconds 15] [--out scauri_foto_notte.mp4]
+Uso:  python3 scauri_foto_notte.py [--seconds 15] [--verticale] [--out scauri_foto_notte.mp4]
 """
 import argparse
 import math
@@ -13,7 +13,8 @@ import imageio.v2 as imageio
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-W, H = 1280, 720
+W, H = 1280, 720  # --verticale imposta 1080x1920
+CENTER_X = 1240  # centro dell'inquadratura verticale (torre a sinistra, albergo a destra), coordinate foto
 MARGIN = 1.12  # margine per lo zoom lento
 TILT = math.degrees(math.atan(0.096))  # l'orizzonte nella foto sale di ~5.5° verso destra
 
@@ -68,13 +69,17 @@ def light_layers(size):
         r = rng.uniform(1.6, 3.2)
         d.ellipse([x - r, y - r, x + r, y + r], fill=c)
     halo = lights.filter(ImageFilter.GaussianBlur(9))
+    # lucina rossa di segnalazione visibile nella foto sotto il promontorio
+    red = Image.new("L", size, 0)
+    ImageDraw.Draw(red).ellipse([1050, 740, 1064, 754], fill=255)
+    red = red.filter(ImageFilter.GaussianBlur(5))
     # torre sul Monte d'Oro: maschera morbida per illuminarla dal basso con luce calda
     wash = Image.new("L", size, 0)
     ImageDraw.Draw(wash).ellipse([955, 640, 1005, 700], fill=255)
     wash = wash.filter(ImageFilter.GaussianBlur(10))
     phase = (rng.random((h // 8, w // 8)) * 255).astype(np.uint8)
     phase = Image.fromarray(phase).resize(size, Image.NEAREST)
-    return lights, halo, phase, wash
+    return lights, halo, phase, wash, red
 
 
 def fit_transform(img, resample):
@@ -85,11 +90,17 @@ def fit_transform(img, resample):
     cw = int((w * math.cos(t) - h * math.sin(t)) / math.cos(2 * t))
     ch = int((h * math.cos(t) - w * math.sin(t)) / math.cos(2 * t))
     r = r.crop(((w - cw) // 2, (h - ch) // 2, (w + cw) // 2, (h + ch) // 2))
-    # 16:9: tiene l'orizzonte a ~45% dall'alto
-    tw = r.width
-    th = int(tw * 9 / 16)
-    top = int(min(max(r.height * 0.36 - th * 0.45 + 180, 0), r.height - th))
-    r = r.crop((0, top, tw, top + th))
+    if W > H:  # 16:9: tiene l'orizzonte a ~45% dall'alto
+        tw = r.width
+        th = int(tw * H / W)
+        top = int(min(max(r.height * 0.36 - th * 0.45 + 180, 0), r.height - th))
+        r = r.crop((0, top, tw, top + th))
+    else:  # 9:16: tutta l'altezza, stretto sul promontorio
+        th = r.height
+        tw = int(th * W / H)
+        cx = CENTER_X - (w - cw) // 2
+        left = int(min(max(cx - tw / 2, 0), r.width - tw))
+        r = r.crop((left, 0, left + tw, th))
     return r.resize((int(W * MARGIN), int(H * MARGIN)), resample)
 
 
@@ -104,11 +115,15 @@ def main():
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--out", default="scauri_foto_notte.mp4")
     ap.add_argument("--no-title", action="store_true")
+    ap.add_argument("--verticale", action="store_true", help="1080x1920 per Reels/TikTok")
     args = ap.parse_args()
+    global W, H
+    if args.verticale:
+        W, H = 1080, 1920
 
     src = ImageOps.exif_transpose(Image.open(args.image)).convert("RGB")
     sky_o, sea_o, _ = masks_original(src)
-    lights_o, halo_o, phase_o, wash_o = light_layers(src.size)
+    lights_o, halo_o, phase_o, wash_o, red_o = light_layers(src.size)
 
     photo = to_f(fit_transform(src, Image.BICUBIC)) / 255
     sky = to_f(fit_transform(Image.fromarray((sky_o * 255).astype(np.uint8)), Image.BILINEAR)) / 255
@@ -118,9 +133,13 @@ def main():
     halo = to_f(fit_transform(halo_o, Image.BILINEAR)) / 255
     phase = to_f(fit_transform(phase_o, Image.NEAREST)) / 255 * 6.28
     wash = to_f(fit_transform(wash_o, Image.BILINEAR))[..., None] / 255
+    red = to_f(fit_transform(red_o, Image.BILINEAR)) / 255
+    red = red / max(red.max(), 1e-6)
     bh, bw = sky.shape
     land = np.clip(1 - sky - sea, 0, 1)
     yy, xx = np.mgrid[0:bh, 0:bw].astype(np.float32)
+    sc = bh / 806.0  # scala delle misure in pixel rispetto al formato 1280x720
+    xs, ys = xx / sc, yy / sc
 
     # Orizzonte nel fotogramma di lavoro: prima riga di mare per colonna
     hz_row = np.argmax(sea > 0.5, axis=0).astype(np.float32)
@@ -142,14 +161,15 @@ def main():
     base += photo * wash * np.array([1.1, 0.7, 0.35]) * 0.6  # torre illuminata
 
     # Riflessi delle luci della costa: strisce verticali sotto la riva
-    top = int(horizon) - 40
+    top = int(horizon - 40 * sc)
+    rl = int(140 * sc)
     strip = Image.fromarray((np.clip(lights[top:int(horizon)] + halo[top:int(horizon)] * 0.5, 0, 1) * 255).astype(np.uint8))
-    strip = strip.transpose(Image.FLIP_TOP_BOTTOM).resize((bw, 140), Image.BILINEAR)
+    strip = strip.transpose(Image.FLIP_TOP_BOTTOM).resize((bw, rl), Image.BILINEAR)
     strip = strip.filter(ImageFilter.BoxBlur(1)).filter(ImageFilter.GaussianBlur(1.2))
     refl = np.zeros_like(base)
     y0 = int(horizon) + 1
-    y1 = min(bh, y0 + 140)
-    fade = np.exp(-np.arange(y1 - y0) / 55.0)[:, None, None]
+    y1 = min(bh, y0 + rl)
+    fade = np.exp(-np.arange(y1 - y0) / (55.0 * sc))[:, None, None]
     refl[y0:y1] = to_f(strip)[: y1 - y0] / 255 * fade * 0.55
     base += refl * sea[..., None]
 
@@ -158,16 +178,20 @@ def main():
     # --- stelle ---
     rng = np.random.default_rng(5)
     stars = []
-    while len(stars) < 320:
+    while len(stars) < int(320 * bw * bh / (1433 * 806)):
         x, y = int(rng.integers(0, bw)), int(rng.integers(0, int(horizon * 0.95)))
         if sky[y, x] > 0.99:
             stars.append((x, y, rng.uniform(0.25, 1.0), rng.uniform(0.6, 3.0), rng.uniform(0, 6.28)))
 
-    moon_x, moon_y, moon_r = bw * 0.30, bh * 0.17, 20.0
+    if args.verticale:
+        moon_x, moon_y = bw * 0.26, bh * 0.12
+    else:
+        moon_x, moon_y = bw * 0.30, bh * 0.17
+    moon_r = 20.0 * sc
 
     try:
-        font = ImageFont.truetype("DejaVuSerif.ttf", 54)
-        small = ImageFont.truetype("DejaVuSans.ttf", 22)
+        font = ImageFont.truetype("DejaVuSerif.ttf", 54 if W > H else 88)
+        small = ImageFont.truetype("DejaVuSans.ttf", 22 if W > H else 38)
     except OSError:
         font = small = ImageFont.load_default()
 
@@ -181,9 +205,9 @@ def main():
         e = p * p * (3 - 2 * p)
 
         # Mare vivo: spostamento ondulatorio che cresce verso la riva
-        amp = 0.6 + 4.5 * depth
-        dx = amp * np.sin(yy * 0.045 - t * 1.4 + xx * 0.004)
-        dy = amp * 0.45 * np.sin(yy * 0.06 + xx * 0.012 - t * 1.1)
+        amp = (0.6 + 4.5 * depth) * sc
+        dx = amp * np.sin(ys * 0.045 - t * 1.4 + xs * 0.004)
+        dy = amp * 0.45 * np.sin(ys * 0.06 + xs * 0.012 - t * 1.1)
         sxf = np.clip(xx + dx * seay, 0, bw - 1.001)
         syf = np.clip(yy + dy * seay, 0, bh - 1.001)
         syf = np.where(seay, np.maximum(syf, hz_row[sxf.astype(np.int32)] + 2), yy)
@@ -202,10 +226,10 @@ def main():
 
         # Luna e riflesso
         d = np.sqrt((xx - moon_x) ** 2 + (yy - moon_y) ** 2)
-        f += (np.exp(-(d / 90) ** 2) * 0.22 * sky)[..., None] * np.array([0.6, 0.65, 0.85])
+        f += (np.exp(-(d / (90 * sc)) ** 2) * 0.22 * sky)[..., None] * np.array([0.6, 0.65, 0.85])
         disk = np.clip(moon_r - d, 0, 1)[..., None]
         f = f * (1 - disk) + disk * np.array([0.97, 0.95, 0.88])
-        spread = 12 + depth * 260
+        spread = (12 + depth * 260) * sc
         beam = np.exp(-((xx - moon_x) / spread) ** 2) * sea
         shimmer = 0.65 + 0.35 * np.sin(t * 2.6 + phase * 3)
         f += (beam * (0.06 + 0.75 * fm * shimmer))[..., None] * np.array([0.85, 0.83, 0.72])
@@ -219,14 +243,13 @@ def main():
         flick = 0.8 + 0.2 * np.sin(t * 5 + phase[..., None])
         f = np.maximum(f, lights * flick) + halo * 0.9
         blink = max(0.0, math.sin(t * 2.4)) ** 6
-        rx, ry = bw * 0.378, horizon - 16
-        f += (np.exp(-((xx - rx) ** 2 + (yy - ry) ** 2) / 18) * blink)[..., None] * np.array([1.0, 0.1, 0.05])
+        f += (red * blink)[..., None] * np.array([1.0, 0.1, 0.05])
 
         # Zoom lento
         img = Image.fromarray((np.clip(f, 0, 1) * 255).astype(np.uint8))
         z = 1 + (MARGIN - 1) * e
         cw, ch = bw / z, bh / z
-        cx, cy = bw / 2 + (bw - cw) * 0.15 * e, bh / 2
+        cx, cy = bw / 2 + (bw - cw) * (0.15 if W > H else 0.0) * e, bh / 2
         img = img.resize((W, H), Image.BICUBIC, box=(cx - cw / 2, cy - ch / 2, cx + cw / 2, cy + ch / 2))
 
         if not args.no_title:
@@ -236,8 +259,9 @@ def main():
                 dr = ImageDraw.Draw(layer)
                 title, sub = "Scauri · Minturno", "Monte d'Oro, di notte"
                 tw, sw = dr.textlength(title, font=font), dr.textlength(sub, font=small)
-                dr.text(((W - tw) / 2, H - 190), title, font=font, fill=(250, 242, 225, int(240 * a)))
-                dr.text(((W - sw) / 2, H - 122), sub, font=small, fill=(215, 218, 235, int(210 * a)))
+                ty = H - 190 if W > H else H - 420
+                dr.text(((W - tw) / 2, ty), title, font=font, fill=(250, 242, 225, int(240 * a)))
+                dr.text(((W - sw) / 2, ty + font.size * 1.25), sub, font=small, fill=(215, 218, 235, int(210 * a)))
                 shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
                 shadow.putalpha(layer.getchannel("A").filter(ImageFilter.GaussianBlur(8)))
                 img = img.convert("RGBA")
